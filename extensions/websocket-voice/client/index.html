@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw WebSocket Voice Client</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      max-width: 600px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+
+    .card {
+      background: #f9f9f9;
+      padding: 1.5rem;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+    }
+
+    button {
+      padding: 0.5rem 1rem;
+      font-size: 1rem;
+      margin-right: 0.5rem;
+      cursor: pointer;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #status {
+      display: inline-block;
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-weight: bold;
+    }
+
+    .disconnected {
+      background: #fee;
+      color: #c00;
+    }
+
+    .connected {
+      background: #efe;
+      color: #080;
+    }
+
+    #log {
+      margin-top: 1rem;
+      height: 300px;
+      overflow-y: auto;
+      background: #222;
+      color: #0f0;
+      padding: 1rem;
+      font-family: monospace;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>OpenClaw Voice Client</h1>
+
+  <div class="card">
+    <div style="margin-bottom: 1rem;">
+      <label>WebSocket URL:</label><br />
+      <input type="text" id="wsUrl" value="ws://localhost:3000/api/voice/stream"
+        style="width: 100%; padding: 0.5rem; margin-top: 0.5rem;" />
+    </div>
+
+    <div style="margin-bottom: 1rem;">
+      <button id="btnConnect">Connect & Start Mic</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+      <span id="status" class="disconnected">Disconnected</span>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    const btnConnect = document.getElementById('btnConnect');
+    const btnDisconnect = document.getElementById('btnDisconnect');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const wsUrlInput = document.getElementById('wsUrl');
+
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let processor = null;
+
+    // Audio Playback State
+    let playbackTime = 0;
+    let activeSources = [];
+
+    function log(msg) {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function startAudioCapture() {
+      try {
+        // Request microphone access
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 16000 // We try to request 16kHz from browser
+          }
+        });
+
+        // Create an AudioContext at exactly 16kHz
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+
+        // Setup capture pipeline
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        processor.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+          // Get float32 audio data from mic
+          const inputData = e.inputBuffer.getChannelData(0);
+
+          // Convert float32 to int16 PCM
+          const pcm16 = new Int16Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+            // Clamp values
+            const s = Math.max(-1, Math.min(1, inputData[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+
+          // Convert int16 buffer to base64
+          const uint8 = new Uint8Array(pcm16.buffer);
+          let binary = '';
+          for (let i = 0; i < uint8.byteLength; i++) {
+            binary += String.fromCharCode(uint8[i]);
+          }
+          const base64Payload = window.btoa(binary);
+
+          // Send media event
+          ws.send(JSON.stringify({
+            event: "media",
+            media: { payload: base64Payload }
+          }));
+        };
+
+        log("Microphone captured at 16kHz.");
+      } catch (err) {
+        log(`Error accessing microphone: ${err.message}`);
+        disconnect();
+      }
+    }
+
+    function playAudio(base64Payload) {
+      if (!audioContext) return;
+
+      // Decode Base64 to binary
+      const binaryString = window.atob(base64Payload);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert Uint8Array to Int16Array
+      const pcm16 = new Int16Array(bytes.buffer);
+
+      // Convert Int16Array to Float32Array for Web Audio API
+      const float32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        float32[i] = pcm16[i] / 0x8000;
+      }
+
+      // Create AudioBuffer (1 channel, 16kHz)
+      const audioBuffer = audioContext.createBuffer(1, float32.length, 16000);
+      audioBuffer.getChannelData(0).set(float32);
+
+      // Create source node
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+
+      // Queue playback seamlessly
+      if (playbackTime < audioContext.currentTime) {
+        playbackTime = audioContext.currentTime;
+      }
+      source.start(playbackTime);
+      playbackTime += audioBuffer.duration;
+
+      // Keep track of active sources for interruption (barge-in)
+      activeSources.push(source);
+      source.onended = () => {
+        activeSources = activeSources.filter(s => s !== source);
+      };
+    }
+
+    function clearAudioPlayback() {
+      log("Interruption (barge-in) detected. Clearing audio buffer.");
+      activeSources.forEach(source => {
+        try { source.stop(); } catch (e) { }
+      });
+      activeSources = [];
+      if (audioContext) {
+        playbackTime = audioContext.currentTime;
+      }
+    }
+
+    btnConnect.onclick = async () => {
+      const url = wsUrlInput.value;
+      log(`Connecting to ${url}...`);
+
+      ws = new WebSocket(url);
+
+      ws.onopen = async () => {
+        log("WebSocket connected.");
+        statusEl.textContent = "Connected";
+        statusEl.className = "connected";
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+
+        // Send start event
+        ws.send(JSON.stringify({
+          event: "start",
+          config: { sampleRate: 16000, encoding: "pcm_16bit" }
+        }));
+
+        await startAudioCapture();
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+
+          if (msg.event === "transcript") {
+            log(`Transcript [${msg.isFinal ? 'Final' : 'Partial'}]: ${msg.text}`);
+          } else if (msg.event === "media") {
+            playAudio(msg.media.payload);
+          } else if (msg.event === "clear") {
+            clearAudioPlayback();
+          } else if (msg.event === "error") {
+            log(`Server Error: ${msg.message}`);
+          }
+        } catch (e) {
+          log("Error parsing message from server");
+        }
+      };
+
+      ws.onclose = () => {
+        log("WebSocket closed.");
+        disconnect();
+      };
+
+      ws.onerror = (err) => {
+        log("WebSocket error occurred.");
+      };
+    };
+
+    function disconnect() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+      clearAudioPlayback();
+
+      statusEl.textContent = "Disconnected";
+      statusEl.className = "disconnected";
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      log("Disconnected and resources cleaned up.");
+    }
+
+    btnDisconnect.onclick = disconnect;
+  </script>
+</body>
+
+</html>
