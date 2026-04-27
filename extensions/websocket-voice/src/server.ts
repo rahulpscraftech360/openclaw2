@@ -17,6 +17,9 @@ export type VoiceServerConfig = {
   authSecret: string | undefined;
   sttProviderId: string | undefined;
   ttsProviderId: string | undefined;
+  sttProviderConfig: Record<string, unknown> | undefined;
+  ttsProviderConfig: Record<string, unknown> | undefined;
+  debug: boolean | undefined;
 };
 
 export type VoiceServer = {
@@ -143,6 +146,10 @@ export function createVoiceServer(config: VoiceServerConfig, api: OpenClawPlugin
       cfg: api.config,
       sttProvider: resolveSttProvider(config.sttProviderId, api),
       ttsProvider: resolveTtsProvider(config.ttsProviderId, api),
+      sttProviderConfig: config.sttProviderConfig,
+      ttsProviderConfig: config.ttsProviderConfig,
+      debug: config.debug === true,
+      onDebug: (message) => api.logger.info(`[websocket-voice] ${message}`),
     });
 
     activeHandles.set(socket, handle);

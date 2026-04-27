@@ -6,6 +6,9 @@ type PluginConfig = {
   authSecret?: string;
   sttProvider?: string;
   ttsProvider?: string;
+  sttConfig?: Record<string, unknown>;
+  ttsConfig?: Record<string, unknown>;
+  debug?: boolean;
 };
 
 function resolvePort(rawPort: unknown): number {
@@ -48,6 +51,9 @@ export default definePluginEntry({
             authSecret: pluginConfig.authSecret,
             sttProviderId: pluginConfig.sttProvider,
             ttsProviderId: pluginConfig.ttsProvider,
+            sttProviderConfig: pluginConfig.sttConfig,
+            ttsProviderConfig: pluginConfig.ttsConfig,
+            debug: pluginConfig.debug,
           },
           api,
         );

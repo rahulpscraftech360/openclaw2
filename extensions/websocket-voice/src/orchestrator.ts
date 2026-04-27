@@ -8,6 +8,10 @@ export type PipelineDeps = {
   cfg: OpenClawConfig;
   sttProvider: RealtimeTranscriptionProviderPlugin | undefined;
   ttsProvider: SpeechProviderPlugin | undefined;
+  sttProviderConfig: Record<string, unknown> | undefined;
+  ttsProviderConfig: Record<string, unknown> | undefined;
+  debug: boolean;
+  onDebug: (message: string) => void;
 };
 
 export type PipelineHandle = {
@@ -122,6 +126,31 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
   let isCleaningUp = false;
   let currentAbort: AbortController | null = null;
   let transcriptionSession: ReturnType<typeof activeSttProvider.createSession> | null = null;
+  let mediaFrameCount = 0;
+
+  function debug(message: string): void {
+    if (deps.debug) {
+      deps.onDebug(message);
+    }
+  }
+
+  function resolveSttRawConfig(): Record<string, unknown> {
+    if (deps.sttProviderConfig) {
+      return deps.sttProviderConfig;
+    }
+    if (activeSttProvider.id === "deepgram") {
+      return {
+        providers: {
+          deepgram: {
+            encoding: "linear16",
+            sampleRate: 16000,
+            interimResults: true,
+          },
+        },
+      };
+    }
+    return {};
+  }
 
   function handleBargeIn(): void {
     if (currentAbort) {
@@ -145,6 +174,7 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
     const sessionKey = crypto.randomUUID();
 
     try {
+      debug(`final transcript: ${transcript}`);
       const { runId } = await subagent.run({
         sessionKey,
         message: transcript,
@@ -172,13 +202,15 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
 
       const responseText = extractAssistantText(messages);
       if (!responseText) {
+        debug("agent returned no assistant text");
         return;
       }
+      debug(`assistant response text length: ${responseText.length}`);
 
       const ttsProviderConfig =
         activeTtsProvider.resolveConfig?.({
           cfg,
-          rawConfig: resolveTtsRawConfig(cfg),
+          rawConfig: deps.ttsProviderConfig ?? resolveTtsRawConfig(cfg),
           timeoutMs: 30_000,
         }) ?? {};
 
@@ -198,6 +230,7 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
         event: "media",
         media: { payload: synthesis.audioBuffer.toString("base64") },
       });
+      debug(`sent tts audio bytes: ${synthesis.audioBuffer.byteLength}`);
       sendJson(socket, { event: "turn_end" });
     } catch (error: unknown) {
       if (error instanceof Error && error.name === "AbortError") {
@@ -218,13 +251,12 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
     }
 
     try {
+      const sttRawConfig = resolveSttRawConfig();
+      debug(`starting STT provider=${activeSttProvider.id}`);
       transcriptionSession = activeSttProvider.createSession({
-        providerConfig:
-          activeSttProvider.resolveConfig?.({
-            cfg,
-            rawConfig: resolveStreamingSttRawConfig(cfg),
-          }) ?? {},
+        providerConfig: activeSttProvider.resolveConfig?.({ cfg, rawConfig: sttRawConfig }) ?? {},
         onPartial: (partial: string) => {
+          debug(`partial transcript: ${partial}`);
           sendJson(socket, { event: "transcript", text: partial, isFinal: false });
         },
         onTranscript: async (transcript: string) => {
@@ -257,6 +289,7 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
     try {
       const message = JSON.parse(rawDataToString(data)) as Record<string, unknown>;
       if (message.event === "start") {
+        debug("client sent start");
         startTranscriptionSession();
         return;
       }
@@ -267,7 +300,12 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
           if (media && typeof media === "object" && !Array.isArray(media)) {
             const payload = (media as Record<string, unknown>).payload;
             if (typeof payload === "string") {
-              transcriptionSession.sendAudio(Buffer.from(payload, "base64"));
+              const audio = Buffer.from(payload, "base64");
+              mediaFrameCount += 1;
+              if (mediaFrameCount === 1 || mediaFrameCount % 50 === 0) {
+                debug(`received audio frames=${mediaFrameCount} lastBytes=${audio.byteLength}`);
+              }
+              transcriptionSession.sendAudio(audio);
             }
           }
         }
