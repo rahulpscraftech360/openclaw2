@@ -1,23 +1,22 @@
 {
   "id": "websocket-voice",
-  "channelEnvVars": {
-    "websocket-voice": [
-      "WEBSOCKET_VOICE_SECRET"
-    ]
-  },
   "uiHints": {
+    "port": {
+      "label": "WebSocket Port",
+      "help": "Port the voice WebSocket server listens on. Default: 8765."
+    },
     "authSecret": {
       "label": "Authentication Secret",
-      "help": "Secret token required to connect to the WebSocket endpoint. Clients must send this token.",
+      "help": "Optional shared secret. Clients must send ?token=<secret> on connect.",
       "sensitive": true
     },
     "sttProvider": {
       "label": "STT Provider Override",
-      "help": "Override the default realtime transcription provider (e.g. deepgram, xai)."
+      "help": "Override the default realtime transcription provider ID (e.g. deepgram)."
     },
     "ttsProvider": {
       "label": "TTS Provider Override",
-      "help": "Override the default speech synthesis provider (e.g. elevenlabs, azure-speech)."
+      "help": "Override the default speech synthesis provider ID (e.g. elevenlabs)."
     }
   },
   "configSchema": {

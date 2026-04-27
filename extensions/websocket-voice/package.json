@@ -1,19 +1,27 @@
 {
   "name": "@openclaw/websocket-voice",
-  "version": "1.0.0",
+  "version": "2026.4.27",
   "description": "Native bidirectional voice streaming over WebSockets for OpenClaw",
-  "main": "dist/index.js",
   "type": "module",
-  "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "clean": "rimraf dist"
-  },
   "dependencies": {
-    "@fastify/websocket": "^10.0.1",
-    "typebox": "^0.32.34"
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*",
+    "@types/ws": "^8.18.1",
+    "openclaw": "workspace:*"
   },
   "peerDependencies": {
-    "openclaw": "*",
-    "fastify": "^4.26.2"
+    "openclaw": ">=2026.4.25"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
