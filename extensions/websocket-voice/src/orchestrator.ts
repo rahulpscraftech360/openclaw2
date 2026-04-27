@@ -1,185 +1,277 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk/core";
+import type { RealtimeTranscriptionProviderPlugin } from "openclaw/plugin-sdk/realtime-transcription";
+import type { SpeechProviderPlugin } from "openclaw/plugin-sdk/speech";
+import type { WebSocket } from "ws";
 
-export function runPipeline(socket: import("ws").WebSocket, api: OpenClawPluginApi) {
-  let isCleaningUp = false;
-  let isBotSpeaking = false;
-  let currentGenerationAbortController: AbortController | null = null;
+export type PipelineDeps = {
+  subagent: PluginRuntime["subagent"];
+  cfg: OpenClawConfig;
+  sttProvider: RealtimeTranscriptionProviderPlugin | undefined;
+  ttsProvider: SpeechProviderPlugin | undefined;
+};
 
-  // 1. Resolve configured STT and TTS Providers
-  const config = api.pluginConfig as any;
-  const sttProviderId = config?.sttProvider;
-  const ttsProviderId = config?.ttsProvider;
+export type PipelineHandle = {
+  cleanup: () => void;
+};
 
-  const sttProvider = api.runtime.getRealtimeTranscriptionProvider(sttProviderId);
-  const ttsProvider = api.runtime.getSpeechProvider(ttsProviderId);
+function rawDataToString(data: import("ws").RawData): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  if (Buffer.isBuffer(data)) {
+    return data.toString("utf8");
+  }
+  return Buffer.from(data).toString("utf8");
+}
+
+function extractAssistantText(messages: unknown[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      continue;
+    }
+
+    const record = message as Record<string, unknown>;
+    if (record.role !== "assistant") {
+      continue;
+    }
+
+    const content = record.content;
+    if (typeof content === "string") {
+      const text = content.trim();
+      if (text.length > 0) {
+        return text;
+      }
+      continue;
+    }
+
+    if (!Array.isArray(content)) {
+      continue;
+    }
+
+    const text = content
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          !!part &&
+          typeof part === "object" &&
+          !Array.isArray(part) &&
+          (part as Record<string, unknown>).type === "text" &&
+          typeof (part as Record<string, unknown>).text === "string",
+      )
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+
+    if (text.length > 0) {
+      return text;
+    }
+  }
+
+  return null;
+}
+
+function sendJson(socket: WebSocket, payload: Record<string, unknown>): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify(payload));
+}
+
+export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHandle {
+  const { subagent, cfg, sttProvider, ttsProvider } = deps;
 
   if (!sttProvider) {
-    socket.send(JSON.stringify({ event: "error", message: "No RealtimeTranscriptionProvider found" }));
-    socket.close(1011, "Missing STT Provider");
-    return { cleanup };
+    sendJson(socket, { event: "error", message: "No RealtimeTranscriptionProvider configured" });
+    socket.close(1011, "Missing STT provider");
+    return { cleanup: () => undefined };
   }
 
   if (!ttsProvider) {
-    socket.send(JSON.stringify({ event: "error", message: "No SpeechProvider found" }));
-    socket.close(1011, "Missing TTS Provider");
-    return { cleanup };
+    sendJson(socket, { event: "error", message: "No SpeechProvider configured" });
+    socket.close(1011, "Missing TTS provider");
+    return { cleanup: () => undefined };
   }
 
-  // 2. Setup RealtimeTranscription Stream
-  let transcriptionStream: any;
-  
-  async function initializeTranscription() {
-    try {
-      transcriptionStream = await sttProvider.transcribeStream({
-        sampleRate: 16000,
-        encoding: "linear16", // Default expected from client
-        onTranscript: async (text: string, isFinal: boolean) => {
-          if (isCleaningUp) return;
+  const activeSttProvider = sttProvider;
+  const activeTtsProvider = ttsProvider;
 
-          // Send partial/final transcript back to the client
-          socket.send(JSON.stringify({ event: "transcript", text, isFinal }));
+  let isCleaningUp = false;
+  let currentAbort: AbortController | null = null;
+  let transcriptionSession: ReturnType<typeof activeSttProvider.createSession> | null = null;
 
-          // Interruption handling (barge-in)
-          if (isBotSpeaking && text.trim().length > 0) {
-            handleBargeIn();
-          }
-
-          if (isFinal && text.trim().length > 0) {
-            await handleAgentTurn(text);
-          }
-        },
-        onError: (err) => {
-          console.error("[websocket-voice] STT Error:", err);
-          socket.send(JSON.stringify({ event: "error", message: "Transcription error" }));
-        },
-        onClose: () => {
-          console.log("[websocket-voice] STT Stream closed");
-        },
-      });
-    } catch (err) {
-      console.error("[websocket-voice] Failed to start transcription stream:", err);
-      socket.send(JSON.stringify({ event: "error", message: "Failed to initialize STT" }));
-      socket.close(1011, "STT Init Failed");
+  function handleBargeIn(): void {
+    if (currentAbort) {
+      currentAbort.abort();
+      currentAbort = null;
     }
+    sendJson(socket, { event: "clear" });
   }
 
-  // 3. Handle Barge-In
-  function handleBargeIn() {
-    console.log("[websocket-voice] User interrupted (barge-in detected)");
-    
-    // Stop the client from playing any buffered audio
-    socket.send(JSON.stringify({ event: "clear" }));
-    
-    // Cancel the ongoing LLM / TTS generation
-    if (currentGenerationAbortController) {
-      currentGenerationAbortController.abort();
-      currentGenerationAbortController = null;
+  async function handleAgentTurn(transcript: string): Promise<void> {
+    if (isCleaningUp) {
+      return;
     }
-    
-    isBotSpeaking = false;
-  }
 
-  // 4. Handle LLM Agent + TTS Turn
-  async function handleAgentTurn(userInput: string) {
-    if (isCleaningUp) return;
-    
-    // Cancel any previous turn
-    if (currentGenerationAbortController) {
-      currentGenerationAbortController.abort();
+    if (currentAbort) {
+      currentAbort.abort();
     }
-    currentGenerationAbortController = new AbortController();
-    const abortSignal = currentGenerationAbortController.signal;
+
+    const abort = new AbortController();
+    currentAbort = abort;
+    const sessionKey = crypto.randomUUID();
 
     try {
-      // 4a. Run the OpenClaw LLM Agent
-      // We assume api.runtime.agent exposes a completion stream or similar.
-      // (Using a placeholder for the exact agent method, adapted to openclaw's standard runtime agent)
-      const agentStream = await api.runtime.agent.chat({
-        messages: [{ role: "user", content: userInput }],
-        signal: abortSignal,
+      const { runId } = await subagent.run({
+        sessionKey,
+        message: transcript,
+        deliver: false,
       });
 
-      isBotSpeaking = true;
-      let fullResponse = "";
-
-      for await (const chunk of agentStream) {
-        if (abortSignal.aborted) break;
-        fullResponse += chunk.content || "";
+      if (abort.signal.aborted) {
+        return;
       }
 
-      if (abortSignal.aborted) return;
+      const result = await subagent.waitForRun({ runId, timeoutMs: 30_000 });
+      if (abort.signal.aborted) {
+        return;
+      }
 
-      // 4b. Stream the text to TTS Provider
-      const ttsStream = await ttsProvider.synthesizeStream({
-        text: fullResponse,
-        sampleRate: 16000,
+      if (result.status !== "ok") {
+        sendJson(socket, { event: "error", message: "Agent run failed" });
+        return;
+      }
+
+      const { messages } = await subagent.getSessionMessages({ sessionKey, limit: 5 });
+      if (abort.signal.aborted) {
+        return;
+      }
+
+      const responseText = extractAssistantText(messages);
+      if (!responseText) {
+        return;
+      }
+
+      const ttsProviderConfig =
+        activeTtsProvider.resolveConfig?.({ cfg, rawConfig: {}, timeoutMs: 30_000 }) ?? {};
+
+      const synthesis = await activeTtsProvider.synthesize({
+        text: responseText,
+        cfg,
+        providerConfig: ttsProviderConfig,
+        target: "audio-file",
+        timeoutMs: 30_000,
       });
 
-      // 4c. Send synthesized audio chunks back to WebSocket client
-      for await (const audioChunk of ttsStream) {
-        if (abortSignal.aborted) break;
-        
-        socket.send(JSON.stringify({
-          event: "media",
-          media: { payload: audioChunk.toString("base64") }
-        }));
+      if (abort.signal.aborted) {
+        return;
       }
 
-      isBotSpeaking = false;
-      currentGenerationAbortController = null;
-
-    } catch (err: any) {
-      if (err.name === "AbortError") {
-        console.log("[websocket-voice] Agent/TTS turn aborted");
-      } else {
-        console.error("[websocket-voice] Agent/TTS error:", err);
+      sendJson(socket, {
+        event: "media",
+        media: { payload: synthesis.audioBuffer.toString("base64") },
+      });
+      sendJson(socket, { event: "turn_end" });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "AbortError") {
+        return;
       }
-      isBotSpeaking = false;
+      console.error("[websocket-voice] Agent/TTS error:", error);
+      sendJson(socket, { event: "error", message: "Agent or TTS failed" });
+    } finally {
+      if (currentAbort === abort) {
+        currentAbort = null;
+      }
     }
   }
 
-  // 5. Handle incoming WebSocket messages
+  function startTranscriptionSession(): void {
+    if (isCleaningUp) {
+      return;
+    }
+
+    try {
+      transcriptionSession = activeSttProvider.createSession({
+        providerConfig: activeSttProvider.resolveConfig?.({ cfg, rawConfig: {} }) ?? {},
+        onPartial: (partial: string) => {
+          sendJson(socket, { event: "transcript", text: partial, isFinal: false });
+        },
+        onTranscript: async (transcript: string) => {
+          sendJson(socket, { event: "transcript", text: transcript, isFinal: true });
+          if (transcript.trim().length > 0) {
+            await handleAgentTurn(transcript);
+          }
+        },
+        onSpeechStart: () => {
+          handleBargeIn();
+        },
+        onError: (error: Error) => {
+          console.error("[websocket-voice] STT error:", error);
+          sendJson(socket, { event: "error", message: "Transcription error" });
+        },
+      });
+      void transcriptionSession.connect();
+    } catch (error: unknown) {
+      console.error("[websocket-voice] Failed to create STT session:", error);
+      sendJson(socket, { event: "error", message: "Failed to initialize STT" });
+      socket.close(1011, "STT init failed");
+    }
+  }
+
   socket.on("message", (data: import("ws").RawData) => {
-    if (isCleaningUp) return;
+    if (isCleaningUp) {
+      return;
+    }
 
     try {
-      const message = JSON.parse(data.toString());
-      
+      const message = JSON.parse(rawDataToString(data)) as Record<string, unknown>;
       if (message.event === "start") {
-        console.log("[websocket-voice] Received start event");
-        // We could extract sampleRate here and pass to initializeTranscription
-        initializeTranscription();
-      } else if (message.event === "media") {
-        if (transcriptionStream && !isBotSpeaking) {
-          // Decode base64 audio payload and push to STT
-          const buffer = Buffer.from(message.media.payload, "base64");
-          transcriptionStream.write(buffer);
+        startTranscriptionSession();
+        return;
+      }
+
+      if (message.event === "media") {
+        if (transcriptionSession?.isConnected()) {
+          const media = message.media;
+          if (media && typeof media === "object" && !Array.isArray(media)) {
+            const payload = (media as Record<string, unknown>).payload;
+            if (typeof payload === "string") {
+              transcriptionSession.sendAudio(Buffer.from(payload, "base64"));
+            }
+          }
         }
-      } else if (message.event === "stop") {
-        console.log("[websocket-voice] Received stop event");
+        return;
+      }
+
+      if (message.event === "stop") {
         cleanup();
         socket.close();
       }
-    } catch (err) {
-      console.error("[websocket-voice] Error parsing message:", err);
+    } catch {
+      // Ignore malformed client events.
     }
   });
 
-  // 6. Cleanup function
-  function cleanup() {
-    if (isCleaningUp) return;
-    isCleaningUp = true;
-    
-    if (currentGenerationAbortController) {
-      currentGenerationAbortController.abort();
+  function cleanup(): void {
+    if (isCleaningUp) {
+      return;
     }
-    
-    if (transcriptionStream) {
+
+    isCleaningUp = true;
+    if (currentAbort) {
+      currentAbort.abort();
+      currentAbort = null;
+    }
+
+    if (transcriptionSession) {
       try {
-        transcriptionStream.close();
-      } catch (e) {
-        // Ignore close errors
+        transcriptionSession.close();
+      } catch {
+        // Ignore close errors.
       }
+      transcriptionSession = null;
     }
   }
 

@@ -1,7 +1,4 @@
-import type {
-  RealtimeTranscriptionProviderPlugin,
-  RealtimeTranscriptionSession,
-} from "openclaw/plugin-sdk/realtime-transcription";
+import type { RealtimeTranscriptionProviderPlugin } from "openclaw/plugin-sdk/realtime-transcription";
 import type { SpeechProviderPlugin } from "openclaw/plugin-sdk/speech";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { WebSocket } from "ws";
@@ -20,11 +17,13 @@ function makeSocket(readyState = 1 /* OPEN */) {
     close: vi.fn(),
     on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       listeners[event] = listeners[event] ?? [];
-      listeners[event]!.push(handler);
+      listeners[event].push(handler);
     }),
     /** Fire a named event on this mock socket. */
     emit(event: string, ...args: unknown[]) {
-      for (const h of listeners[event] ?? []) h(...args);
+      for (const h of listeners[event] ?? []) {
+        h(...args);
+      }
     },
     sent,
   };
@@ -34,9 +33,20 @@ function makeSocket(readyState = 1 /* OPEN */) {
   };
 }
 
-function makeSession(): RealtimeTranscriptionSession & {
-  _cbs: Record<string, (...a: unknown[]) => void>;
-} {
+type MockSession = {
+  connect: ReturnType<typeof vi.fn>;
+  sendAudio: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  isConnected: ReturnType<typeof vi.fn>;
+  _cbs: {
+    onPartial?: (text: string) => void;
+    onTranscript?: (text: string) => Promise<void> | void;
+    onSpeechStart?: () => void;
+    onError?: (error: Error) => void;
+  };
+};
+
+function makeSession(): MockSession {
   return {
     connect: vi.fn().mockResolvedValue(undefined),
     sendAudio: vi.fn(),
@@ -63,7 +73,10 @@ function makeDeps(): PipelineDeps & {
     id: "mock-stt",
     label: "Mock STT",
     isConfigured: () => true,
-    createSession: vi.fn().mockReturnValue(session),
+    createSession: vi.fn((callbacks: MockSession["_cbs"]) => {
+      session._cbs = callbacks;
+      return session;
+    }),
   } as unknown as RealtimeTranscriptionProviderPlugin;
 
   const ttsProvider = {
@@ -112,21 +125,13 @@ describe("runPipeline", () => {
   function startSession() {
     runPipeline(socket, deps);
     socket.emit("message", JSON.stringify({ event: "start" }));
-    const createSessionMock = vi.mocked(
-      (deps.sttProvider as { createSession: ReturnType<typeof vi.fn> }).createSession,
-    );
-    return createSessionMock.mock.calls[0]![0] as {
-      onPartial?: (t: string) => void;
-      onTranscript?: (t: string) => Promise<void> | void;
-      onSpeechStart?: () => void;
-      onError?: (e: Error) => void;
-    };
+    return deps.session._cbs;
   }
 
   it('{"event":"start"} creates STT session and calls connect()', () => {
     startSession();
     expect(
-      (deps.sttProvider as { createSession: ReturnType<typeof vi.fn> }).createSession,
+      (deps.sttProvider as unknown as { createSession: ReturnType<typeof vi.fn> }).createSession,
     ).toHaveBeenCalledOnce();
     expect(deps.session.connect).toHaveBeenCalledOnce();
   });

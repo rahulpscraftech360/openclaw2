@@ -70,7 +70,7 @@
   <div class="card">
     <div style="margin-bottom: 1rem;">
       <label>WebSocket URL:</label><br />
-      <input type="text" id="wsUrl" value="ws://localhost:3000/api/voice/stream"
+      <input type="text" id="wsUrl" value="ws://localhost:8765"
         style="width: 100%; padding: 0.5rem; margin-top: 0.5rem;" />
     </div>
 
@@ -164,7 +164,22 @@
       }
     }
 
-    function playAudio(base64Payload) {
+    function decodePcm16Audio(audioContext, bytes) {
+      const pcm16 = new Int16Array(
+        bytes.buffer,
+        bytes.byteOffset,
+        Math.floor(bytes.byteLength / 2),
+      );
+      const float32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        float32[i] = pcm16[i] / 0x8000;
+      }
+      const audioBuffer = audioContext.createBuffer(1, float32.length, 16000);
+      audioBuffer.getChannelData(0).set(float32);
+      return audioBuffer;
+    }
+
+    async function playAudio(base64Payload) {
       if (!audioContext) return;
 
       // Decode Base64 to binary
@@ -174,19 +189,15 @@
       for (let i = 0; i < len; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
-
-      // Convert Uint8Array to Int16Array
-      const pcm16 = new Int16Array(bytes.buffer);
-
-      // Convert Int16Array to Float32Array for Web Audio API
-      const float32 = new Float32Array(pcm16.length);
-      for (let i = 0; i < pcm16.length; i++) {
-        float32[i] = pcm16[i] / 0x8000;
+      const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      let audioBuffer;
+      try {
+        // Preferred path for encoded outputs (e.g. mp3) from speech providers.
+        audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      } catch (err) {
+        // Fallback for raw PCM16 payloads.
+        audioBuffer = decodePcm16Audio(audioContext, bytes);
       }
-
-      // Create AudioBuffer (1 channel, 16kHz)
-      const audioBuffer = audioContext.createBuffer(1, float32.length, 16000);
-      audioBuffer.getChannelData(0).set(float32);
 
       // Create source node
       const source = audioContext.createBufferSource();
@@ -247,7 +258,7 @@
           if (msg.event === "transcript") {
             log(`Transcript [${msg.isFinal ? 'Final' : 'Partial'}]: ${msg.text}`);
           } else if (msg.event === "media") {
-            playAudio(msg.media.payload);
+            void playAudio(msg.media.payload);
           } else if (msg.event === "clear") {
             clearAudioPlayback();
           } else if (msg.event === "error") {
