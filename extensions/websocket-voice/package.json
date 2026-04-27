@@ -1,16 +1,27 @@
 {
-  "name": "@openclaw/websocket-voice",
+  "name": "@cheeko-ai/websocket-voice",
   "version": "2026.4.27",
-  "private": true,
+  "private": false,
   "description": "Native bidirectional voice streaming over WebSockets for OpenClaw",
+  "files": [
+    "dist/",
+    "client/",
+    "openclaw.plugin.json",
+    "README.md",
+    "PRD.md"
+  ],
   "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsdown index.ts --no-config --format esm --platform node --target es2023 --out-dir dist --deps.never-bundle openclaw --deps.never-bundle openclaw/plugin-sdk/plugin-entry --deps.never-bundle ws && node -e \"require('node:fs').copyFileSync('dist/index.mjs', 'dist/index.js')\"",
+    "pack:local": "pnpm build && pnpm pack"
+  },
   "dependencies": {
     "ws": "^8.20.0"
   },
   "devDependencies": {
-    "@openclaw/plugin-sdk": "workspace:*",
     "@types/ws": "^8.18.1",
-    "openclaw": "workspace:*"
+    "openclaw": ">=2026.4.25"
   },
   "peerDependencies": {
     "openclaw": ">=2026.4.25"
@@ -23,6 +34,14 @@
   "openclaw": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "@cheeko-ai/websocket-voice",
+      "localPath": "extensions/websocket-voice",
+      "defaultChoice": "npm"
+    }
   }
 }
