@@ -1,6 +1,7 @@
 {
   "name": "@openclaw/websocket-voice",
   "version": "2026.4.27",
+  "private": true,
   "description": "Native bidirectional voice streaming over WebSockets for OpenClaw",
   "type": "module",
   "dependencies": {
