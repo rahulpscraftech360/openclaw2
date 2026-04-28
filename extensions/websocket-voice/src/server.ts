@@ -141,15 +141,23 @@ export function createVoiceServer(config: VoiceServerConfig, api: OpenClawPlugin
       }
     }
 
+    const resolvedStt = resolveSttProvider(config.sttProviderId, api);
+    const resolvedTts = resolveTtsProvider(config.ttsProviderId, api);
+    api.logger.info(
+      `[websocket-voice] connection — stt=${resolvedStt?.id ?? "NONE"} tts=${resolvedTts?.id ?? "NONE"}`,
+    );
+
     const handle = runPipeline(socket, {
       subagent: api.runtime.subagent,
       cfg: api.config,
-      sttProvider: resolveSttProvider(config.sttProviderId, api),
-      ttsProvider: resolveTtsProvider(config.ttsProviderId, api),
+      sttProvider: resolvedStt,
+      ttsProvider: resolvedTts,
       sttProviderConfig: config.sttProviderConfig,
       ttsProviderConfig: config.ttsProviderConfig,
       debug: config.debug === true,
-      onDebug: (message) => api.logger.info(`[websocket-voice] ${message}`),
+      onDebug: (message) => api.logger.info(`[websocket-voice] dbg: ${message}`),
+      onInfo: (message) => api.logger.info(`[websocket-voice] ${message}`),
+      onError: (message, _error) => api.logger.error(`[websocket-voice] ${message}`),
     });
 
     activeHandles.set(socket, handle);

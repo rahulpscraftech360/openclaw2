@@ -12,6 +12,8 @@ export type PipelineDeps = {
   ttsProviderConfig: Record<string, unknown> | undefined;
   debug: boolean;
   onDebug: (message: string) => void;
+  onInfo: (message: string) => void;
+  onError: (message: string, error?: unknown) => void;
 };
 
 export type PipelineHandle = {
@@ -175,44 +177,66 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
 
     try {
       debug(`final transcript: ${transcript}`);
+      const t0 = Date.now();
       const { runId } = await subagent.run({
         sessionKey,
         message: transcript,
         deliver: false,
+        lightContext: true,
       });
+      deps.onInfo(`subagent.run done runId=${runId} ms=${Date.now() - t0}`);
 
       if (abort.signal.aborted) {
         return;
       }
 
-      const result = await subagent.waitForRun({ runId, timeoutMs: 30_000 });
+      const t1 = Date.now();
+      const result = await subagent.waitForRun({ runId, timeoutMs: 60000 });
+      deps.onInfo(`waitForRun done status=${result.status} ms=${Date.now() - t1}`);
       if (abort.signal.aborted) {
         return;
       }
 
       if (result.status !== "ok") {
+        deps.onError(
+          `agent run failed status=${result.status}${result.error ? ` error=${result.error}` : ""}`,
+        );
         sendJson(socket, { event: "error", message: "Agent run failed" });
         return;
       }
 
-      const { messages } = await subagent.getSessionMessages({ sessionKey, limit: 5 });
+      const { messages } = await subagent.getSessionMessages({ sessionKey, limit: 20 });
       if (abort.signal.aborted) {
         return;
       }
 
       const responseText = extractAssistantText(messages);
       if (!responseText) {
-        debug("agent returned no assistant text");
+        deps.onError(`agent returned no assistant text (messages=${messages.length})`);
+        sendJson(socket, { event: "turn_end" });
         return;
       }
+      deps.onInfo(
+        `TTS start provider=${activeTtsProvider.id} textLen=${responseText.length} text="${responseText.slice(0, 80)}${responseText.length > 80 ? "…" : ""}"`,
+      );
       debug(`assistant response text length: ${responseText.length}`);
+
+      const rawTtsConfig = deps.ttsProviderConfig ?? resolveTtsRawConfig(cfg);
+      deps.onInfo(
+        `TTS rawConfig keys=${Object.keys(rawTtsConfig).join(",")} providers=${JSON.stringify((rawTtsConfig as Record<string, unknown>).providers ?? null)}`,
+      );
 
       const ttsProviderConfig =
         activeTtsProvider.resolveConfig?.({
           cfg,
-          rawConfig: deps.ttsProviderConfig ?? resolveTtsRawConfig(cfg),
+          rawConfig: rawTtsConfig,
           timeoutMs: 30_000,
         }) ?? {};
+
+      const resolvedKeys = Object.keys(ttsProviderConfig);
+      deps.onInfo(
+        `TTS resolvedConfig keys=${resolvedKeys.join(",")} hasApiKey=${resolvedKeys.includes("apiKey")}`,
+      );
 
       const synthesis = await activeTtsProvider.synthesize({
         text: responseText,
@@ -226,6 +250,14 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
         return;
       }
 
+      const byteLen = synthesis.audioBuffer?.byteLength ?? 0;
+      deps.onInfo(`TTS synthesis done bytes=${byteLen}`);
+      if (byteLen === 0) {
+        deps.onError("TTS returned empty audio buffer");
+        sendJson(socket, { event: "turn_end" });
+        return;
+      }
+
       sendJson(socket, {
         event: "media",
         media: { payload: synthesis.audioBuffer.toString("base64") },
@@ -236,7 +268,13 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
       if (error instanceof Error && error.name === "AbortError") {
         return;
       }
-      console.error("[websocket-voice] Agent/TTS error:", error);
+      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      const stack = error instanceof Error ? (error.stack ?? "") : "";
+      const maybeBody =
+        (error as Record<string, unknown>)?.response ?? (error as Record<string, unknown>)?.body;
+      deps.onError(
+        `Agent/TTS error: ${detail}${maybeBody ? ` | body=${JSON.stringify(maybeBody)}` : ""}${stack ? `\n${stack}` : ""}`,
+      );
       sendJson(socket, { event: "error", message: "Agent or TTS failed" });
     } finally {
       if (currentAbort === abort) {
@@ -269,13 +307,14 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
           handleBargeIn();
         },
         onError: (error: Error) => {
-          console.error("[websocket-voice] STT error:", error);
+          deps.onError(`STT error: ${error.message}`, error);
           sendJson(socket, { event: "error", message: "Transcription error" });
         },
       });
       void transcriptionSession.connect();
     } catch (error: unknown) {
-      console.error("[websocket-voice] Failed to create STT session:", error);
+      const msg = error instanceof Error ? error.message : String(error);
+      deps.onError(`Failed to create STT session: ${msg}`, error);
       sendJson(socket, { event: "error", message: "Failed to initialize STT" });
       socket.close(1011, "STT init failed");
     }

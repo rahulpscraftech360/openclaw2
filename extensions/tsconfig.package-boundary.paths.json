@@ -40,9 +40,16 @@
       "openclaw/plugin-sdk/provider-catalog-shared": [
         "../packages/plugin-sdk/dist/src/plugin-sdk/provider-catalog-shared.d.ts"
       ],
+      "openclaw/plugin-sdk/plugin-entry": [
+        "../packages/plugin-sdk/dist/src/plugin-sdk/plugin-entry.d.ts"
+      ],
       "openclaw/plugin-sdk/provider-entry": [
         "../packages/plugin-sdk/dist/src/plugin-sdk/provider-entry.d.ts"
       ],
+      "openclaw/plugin-sdk/realtime-transcription": [
+        "../packages/plugin-sdk/dist/src/plugin-sdk/realtime-transcription.d.ts"
+      ],
+      "openclaw/plugin-sdk/speech": ["../packages/plugin-sdk/dist/src/plugin-sdk/speech.d.ts"],
       "openclaw/plugin-sdk/secret-ref-runtime": [
         "../dist/plugin-sdk/src/plugin-sdk/secret-ref-runtime.d.ts"
       ],
