@@ -14,6 +14,27 @@ export type PipelineHandle = {
   cleanup: () => void;
 };
 
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function resolveTtsRawConfig(cfg: OpenClawConfig): Record<string, unknown> {
+  const root = readRecord(cfg);
+  const messages = readRecord(root?.messages);
+  return readRecord(messages?.tts) ?? {};
+}
+
+function resolveStreamingSttRawConfig(cfg: OpenClawConfig): Record<string, unknown> {
+  const root = readRecord(cfg);
+  const plugins = readRecord(root?.plugins);
+  const entries = readRecord(plugins?.entries);
+  const voiceCall = readRecord(entries?.["voice-call"]);
+  const config = readRecord(voiceCall?.config);
+  return readRecord(config?.streaming) ?? {};
+}
+
 function rawDataToString(data: import("ws").RawData): string {
   if (typeof data === "string") {
     return data;
@@ -155,7 +176,11 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
       }
 
       const ttsProviderConfig =
-        activeTtsProvider.resolveConfig?.({ cfg, rawConfig: {}, timeoutMs: 30_000 }) ?? {};
+        activeTtsProvider.resolveConfig?.({
+          cfg,
+          rawConfig: resolveTtsRawConfig(cfg),
+          timeoutMs: 30_000,
+        }) ?? {};
 
       const synthesis = await activeTtsProvider.synthesize({
         text: responseText,
@@ -194,7 +219,11 @@ export function runPipeline(socket: WebSocket, deps: PipelineDeps): PipelineHand
 
     try {
       transcriptionSession = activeSttProvider.createSession({
-        providerConfig: activeSttProvider.resolveConfig?.({ cfg, rawConfig: {} }) ?? {},
+        providerConfig:
+          activeSttProvider.resolveConfig?.({
+            cfg,
+            rawConfig: resolveStreamingSttRawConfig(cfg),
+          }) ?? {},
         onPartial: (partial: string) => {
           sendJson(socket, { event: "transcript", text: partial, isFinal: false });
         },
